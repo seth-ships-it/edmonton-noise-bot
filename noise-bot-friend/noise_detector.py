@@ -28,6 +28,7 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+from config_store import apply_config_patch, read_config
 from notifier import Notifier
 from audio_classifier import classify_audio
 
@@ -150,8 +151,7 @@ def upload_recording_to_hub(wav_path, event_meta):
         return
     try:
         import base64
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = read_config(CONFIG_FILE)
         fleet_cfg = cfg.get("fleet_hub", {})
         if not fleet_cfg.get("enabled", True):
             return
@@ -196,8 +196,7 @@ def sync_unuploaded_recordings():
     if not os.path.exists(OUTPUT_DIR):
         return
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = read_config(CONFIG_FILE)
         fleet_cfg = cfg.get("fleet_hub", {})
         if not fleet_cfg.get("enabled", True):
             return
@@ -254,8 +253,7 @@ def send_fleet_heartbeat(event_payload=None):
     if not os.path.exists(CONFIG_FILE):
         return
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = read_config(CONFIG_FILE)
         fleet_cfg = cfg.get("fleet_hub", {})
         if not fleet_cfg.get("enabled", True):
             return
@@ -287,6 +285,15 @@ def send_fleet_heartbeat(event_payload=None):
             "version": "v1.4"
         }
 
+        payload.update({
+            "config_reporting_version": 1,
+            "config_update_ack": cfg.get("_hub_config_revision"),
+            "config_state": {key: cfg[key] for key in (
+                "floor_number", "horizontal_setback_meters", "distance_to_road_meters",
+                "calibration_offset", "threshold_dba", "audio_device_index",
+                "cooldown_period_minutes", "record_event_seconds", "save_audio_files") if key in cfg},
+        })
+
         if event_payload:
             payload["event"] = event_payload
 
@@ -303,12 +310,11 @@ def send_fleet_heartbeat(event_payload=None):
                     resp_data = json.loads(resp.read().decode("utf-8"))
                     cfg_up = resp_data.get("config_update")
                     if cfg_up and isinstance(cfg_up, dict):
-                        cur_cfg = load_config()
-                        cur_cfg.update(cfg_up)
-                        save_config(cur_cfg)
+                        cur_cfg, changed = apply_config_patch(CONFIG_FILE, cfg_up, resp_data.get("config_update_revision"))
                         try:
-                            with open(os.path.join(BASE_DIR, ".reload_trigger"), "w") as rf:
-                                rf.write(str(time.time()))
+                            if changed:
+                                with open(os.path.join(BASE_DIR, ".reload_trigger"), "w") as rf:
+                                    rf.write(str(time.time()))
                         except Exception:
                             pass
                         print(f"[Detector] Over-the-air config updated from Fleet Hub: floor={cur_cfg.get('floor_number')}, setback={cur_cfg.get('horizontal_setback_meters')}")
@@ -349,8 +355,7 @@ def main():
     config = {}
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
+            config = read_config(CONFIG_FILE)
         except Exception as e:
             logging.error(f"Failed to read {CONFIG_FILE}: {e}")
 
@@ -465,6 +470,8 @@ def main():
     post_trigger_count = 0
     last_notification_time = 0.0
     last_state_write_time = 0.0
+    last_config_check = 0.0
+    config_mtime = os.stat(CONFIG_FILE).st_mtime_ns if os.path.exists(CONFIG_FILE) else None
 
     try:
         while True:
@@ -496,6 +503,17 @@ def main():
                 dba = 0.0
 
             now = time.time()
+            if not is_recording_event and now - last_config_check > 1.0:
+                last_config_check = now
+                try:
+                    current_mtime = os.stat(CONFIG_FILE).st_mtime_ns
+                    if current_mtime != config_mtime:
+                        config = read_config(CONFIG_FILE)
+                        threshold_dba = args.threshold or config.get("threshold_dba") or 70.0
+                        calibration_offset = args.offset if args.offset is not None else config.get("calibration_offset", 95.0)
+                        config_mtime = current_mtime
+                except (OSError, ValueError) as exc:
+                    logging.warning("Settings reload deferred: %s", exc)
             if now - last_state_write_time > 0.2:
                 last_state_write_time = now
                 try:
