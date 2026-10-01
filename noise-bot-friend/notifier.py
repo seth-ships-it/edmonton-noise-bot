@@ -1,3 +1,4 @@
+from config_store import read_config
 import os
 import json
 import logging
@@ -130,16 +131,13 @@ class Notifier:
         try:
             if isinstance(self.config_path, dict):
                 if os.path.exists("config.json"):
-                    with open("config.json", "r", encoding="utf-8") as f:
-                        return json.load(f)
+                    return read_config("config.json")
                 return self.config_path
             if isinstance(self.config_path, str):
                 if os.path.exists(self.config_path):
-                    with open(self.config_path, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                    return read_config(self.config_path)
                 elif os.path.exists("config.json"):
-                    with open("config.json", "r", encoding="utf-8") as f:
-                        return json.load(f)
+                    return read_config("config.json")
                 elif os.path.exists("config.example.json"):
                     with open("config.example.json", "r", encoding="utf-8") as f:
                         return json.load(f)

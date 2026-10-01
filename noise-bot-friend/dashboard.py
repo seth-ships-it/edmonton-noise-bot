@@ -1,4 +1,5 @@
 import os
+from config_store import apply_config_patch, read_config
 import re
 import sys
 import json
@@ -57,8 +58,7 @@ ALLOWED_TAGS = ["traffic", "vehicle", "ets", "weather", "siren", "construction",
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return read_config(CONFIG_FILE)
         except Exception:
             pass
     if os.path.exists(CONFIG_EXAMPLE_FILE):
@@ -79,8 +79,7 @@ def load_config():
     }
 
 def save_config(new_config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(new_config, f, indent=2)
+    return apply_config_patch(CONFIG_FILE, new_config)[0]
 
 def load_fleet_db():
     if os.path.exists(FLEET_DB_FILE):
@@ -1302,7 +1301,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     function calculateTriangulation() {
       const floor = parseInt(document.getElementById('cfgFloorNumber').value) || 1;
-      const setback = parseFloat(document.getElementById('cfgSetbackMeters').value) || 5.0;
+      const setback = Number(document.getElementById('cfgSetbackMeters').value);
       
       const height = (floor - 1) * 3.0;
       const dist = Math.sqrt(Math.pow(setback, 2) + Math.pow(height, 2));
@@ -2222,7 +2221,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           renderEvents();
           updateStationBranding(loadedConfig.station_name || loadedConfig.location_name, loadedConfig.street_name, loadedConfig.location_name, fNum, sMeters);
           document.getElementById('cfgThreshold').value = loadedConfig.threshold_dba || 75;
-          document.getElementById('cfgOffset').value = loadedConfig.calibration_offset || 50;
+          document.getElementById('cfgOffset').value = loadedConfig.calibration_offset ?? 50;
 
           const devSelect = document.getElementById('cfgAudioDevice');
           if (devSelect && loadedConfig.audio_device_index !== null && loadedConfig.audio_device_index !== undefined) {
@@ -2246,21 +2245,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const nBtn = document.getElementById('navFleetBtn');
           if (hBtn) { hBtn.href = targetFleetUrl; hBtn.target = '_self'; }
           if (nBtn) { nBtn.href = targetFleetUrl; nBtn.target = '_self'; }
+          settingsInitialValues = readSettingsForm();
         }
       } catch (e) {
         console.error(e);
       }
     }
 
-    async function saveSettings() {
+    let settingsInitialValues = null;
+
+    function changedSettings(current, previous) {
+      const patch = {};
+      for (const [key, value] of Object.entries(current)) {
+        const old = previous?.[key];
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const nested = changedSettings(value, old || {});
+          if (Object.keys(nested).length) patch[key] = nested;
+        } else if (JSON.stringify(value) !== JSON.stringify(old)) {
+          patch[key] = value;
+        }
+      }
+      return patch;
+    }
+
+    function readSettingsForm() {
       const codeInp = document.getElementById('adminPasscode');
       const code = (codeInp && codeInp.value ? codeInp.value.trim() : '') || sessionStorage.getItem('station_admin_passcode') || currentAdminPasscode || '1811';
       const devVal = document.getElementById('cfgAudioDevice') ? document.getElementById('cfgAudioDevice').value : '';
       const finalDist = calculateTriangulation();
       const fNum = parseInt(document.getElementById('cfgFloorNumber').value) || 1;
-      const sMeters = parseFloat(document.getElementById('cfgSetbackMeters').value) || 5.0;
+      const sMeters = Number(document.getElementById('cfgSetbackMeters').value);
 
-      const payload = {
+      return {
         ...loadedConfig,
         admin_passcode: (codeInp && codeInp.value ? codeInp.value.trim() : '') || loadedConfig.admin_passcode || code,
         street_name: document.getElementById('cfgStreetName').value,
@@ -2287,6 +2303,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           station_name: document.getElementById('cfgFleetStationName').value
         }
       };
+    }
+
+    async function saveSettings() {
+      if (!settingsInitialValues) { alert('Settings have not loaded. Reopen configuration and try again.'); return; }
+      const current = readSettingsForm();
+      const payload = changedSettings(current, settingsInitialValues);
+      if (!Object.keys(payload).length) { closeSettingsModal(); return; }
+      const code = document.getElementById('adminPasscode').value.trim() || sessionStorage.getItem('station_admin_passcode') || currentAdminPasscode;
+      const fNum = current.floor_number;
+      const sMeters = current.horizontal_setback_meters;
 
       try {
         const res = await fetch('/api/config?key=' + encodeURIComponent(code), {
@@ -2295,8 +2321,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           body: JSON.stringify(payload)
         });
         if (res.ok) {
-          loadedConfig = { ...loadedConfig, ...payload };
-          alert('Settings saved and recalculated successfully!');
+          const saved = await res.json();
+          loadedConfig = current;
+          settingsInitialValues = readSettingsForm();
+          alert(saved.message || 'Settings saved.');
           closeSettingsModal();
           updateStationBranding(loadedConfig.station_name || loadedConfig.location_name, loadedConfig.street_name, loadedConfig.location_name, fNum, sMeters);
           calculateTriangulation();

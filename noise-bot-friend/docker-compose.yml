@@ -19,6 +19,8 @@ services:
       - ./fleet_database.json:/app/fleet_database.json
       - ./noise_detector.py:/app/noise_detector.py
       - ./dashboard.py:/app/dashboard.py
+      - ./config_store.py:/app/config_store.py
+      - ./notifier.py:/app/notifier.py
     environment:
       - PORT=5000
       - PYTHONUNBUFFERED=1
