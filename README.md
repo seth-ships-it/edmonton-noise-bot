@@ -18,6 +18,8 @@ Live network map and community telemetry: **[Edmonton Noise Watch](https://sethd
 
 ---
 
+> **Network audio:** besides a USB mic, the detector can read an IP camera's RTSP audio or an ESP32 microphone over UDP. See [noise-bot-friend/README.md → Network audio sources](noise-bot-friend/README.md#-network-audio-sources-optional).
+
 ## 🚀 Quick Start
 
 ### 1. Requirements
@@ -27,7 +29,7 @@ Live network map and community telemetry: **[Edmonton Noise Watch](https://sethd
 
 ### 2. Installation
 
-`ash
+```bash
 # Clone the repository
 git clone https://github.com/seth-ships-it/edmonton-noise-bot.git
 cd edmonton-noise-bot/noise-bot-friend
@@ -35,7 +37,7 @@ cd edmonton-noise-bot/noise-bot-friend
 # Run automated installer
 chmod +x install.sh
 ./install.sh
-`
+```
 
 Open http://<pi-ip>:5000 or http://noise-bot.local:5000 in your browser. Default admin passcode is 1811.
 
@@ -43,7 +45,7 @@ Open http://<pi-ip>:5000 or http://noise-bot.local:5000 in your browser. Default
 
 ## 📁 Repository Structure
 
-`
+```text
 ├── .github/workflows/     # GitHub Actions CI/CD for automated multi-arch Docker builds
 └── noise-bot-friend/      # Main station software
     ├── audio_classifier.py    # Frequency domain classification
@@ -54,9 +56,12 @@ Open http://<pi-ip>:5000 or http://noise-bot.local:5000 in your browser. Default
     ├── install.sh             # Turnkey installer & provisioner setup
     ├── noise_detector.py      # Core audio sampling, dBA filtering & trigger engine
     ├── notifier.py            # Bluesky, Discord, and webhook dispatch
+    ├── rtsp_source.py         # IP camera audio input (RTSP via ffmpeg)
+    ├── udp_source.py          # ESP32 microphone input (UDP PCM stream)
+    ├── calibrated_wav.py      # Calibrated float WAV writer for network sources
     ├── run.py                 # Multi-process supervisor
     └── provisioner/           # IoT Wi-Fi captive portal auto-provisioner
-`
+```
 
 ---
 

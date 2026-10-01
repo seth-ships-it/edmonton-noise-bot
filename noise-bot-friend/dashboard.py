@@ -52,7 +52,7 @@ LIVE_STATE_FILE = os.path.join(BASE_DIR, "live_audio_state.json")
 LOG_FILE = os.path.join(BASE_DIR, "noise_bot.log")
 FLEET_DB_FILE = os.path.join(BASE_DIR, "fleet_database.json")
 
-ALLOWED_TAGS = ["traffic", "vehicle", "ets", "weather", "siren", "construction", "misc", "review"]
+ALLOWED_TAGS = ["traffic", "vehicle", "ets", "bbq", "weather", "siren", "construction", "impulse", "misc", "review"]
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -74,7 +74,7 @@ def load_config():
         "floor_number": 3,
         "horizontal_setback_meters": 5.0,
         "distance_to_road_meters": 10.3,
-        "threshold_dba": 75.0,
+        "threshold_dba": 70.0,
         "calibration_offset": 50.0
     }
 
@@ -909,6 +909,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <option value="construction">🏗️ Construction</option>
               <option value="weather">🌧️ Weather / Wind</option>
               <option value="bbq">🍖 BBQ / Patio</option>
+              <option value="impulse">💥 Impulse / Bang</option>
               <option value="misc">❓ Misc / Other</option>
               <option value="review">⚠️ Needs Review</option>
             </select>
@@ -1145,10 +1146,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <div>
                 <div class="flex justify-between items-center mb-1">
                   <label class="text-xs font-semibold text-slate-700">Horizontal Setback from Road</label>
-                  <span id="setbackLabelText" class="text-xs font-mono font-bold text-indigo-600">5.0 m</span>
+                  <span class="text-xs font-mono font-bold text-indigo-600 whitespace-nowrap">
+                    <input type="number" id="cfgSetbackMeters" min="0.5" max="1000" step="0.5" value="5" oninput="calculateTriangulation()" class="w-20 text-right bg-white border border-slate-300 rounded-md px-1.5 py-0.5 font-mono font-bold text-indigo-600"> m
+                  </span>
                 </div>
-                <input type="range" id="cfgSetbackMeters" min="1" max="60" step="0.5" value="5" oninput="calculateTriangulation()" class="w-full accent-indigo-600">
-                <p class="text-[10px] text-slate-500 mt-1">Distance from building edge to road lane</p>
+                <input type="range" id="cfgSetbackSlider" min="1" max="60" step="0.5" value="5" oninput="document.getElementById('cfgSetbackMeters').value = this.value; calculateTriangulation()" class="w-full accent-indigo-600">
+                <p class="text-[10px] text-slate-500 mt-1">Distance from building edge to road lane. Type a value for more than 60 m.</p>
               </div>
             </div>
 
@@ -1166,8 +1169,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
 
           <div>
+            <label class="block text-xs font-semibold text-slate-600 uppercase mb-2">Audio Source</label>
+            <select id="cfgAudioSource" onchange="updateAudioSourceFields()" class="w-full bg-white border border-slate-300 rounded-xl p-3 text-slate-900 shadow-sm">
+              <option value="pyaudio">🎤 USB Microphone</option>
+              <option value="rtsp">📹 IP Camera (RTSP stream)</option>
+              <option value="udp">📶 ESP32 Microphone (UDP)</option>
+            </select>
+          </div>
+          <div id="srcFieldsPyaudio">
             <label class="block text-xs font-semibold text-slate-600 uppercase mb-2">Microphone Device</label>
             <select id="cfgAudioDevice" class="w-full bg-white border border-slate-300 rounded-xl p-3 text-slate-900 shadow-sm"></select>
+          </div>
+          <div id="srcFieldsRtsp" class="hidden">
+            <label class="block text-xs font-semibold text-slate-600 uppercase mb-1">RTSP Stream URL</label>
+            <input type="password" id="cfgRtspUrl" autocomplete="off" spellcheck="false" placeholder="rtsps://camera-or-nvr:7441/stream-alias" class="w-full bg-white border border-slate-300 rounded-xl p-3 text-slate-900 shadow-sm font-mono text-sm">
+            <p class="text-[11px] text-slate-500 mt-1">Usually contains a password or token. It's stored only in config.json. The first audio track is used, resampled to 48 kHz mono.</p>
+          </div>
+          <div id="srcFieldsUdp" class="hidden">
+            <label class="block text-xs font-semibold text-slate-600 uppercase mb-1">UDP Port</label>
+            <input type="number" id="cfgUdpPort" min="1" max="65535" step="1" class="w-full bg-white border border-slate-300 rounded-xl p-3 text-slate-900 shadow-sm">
+            <p class="text-[11px] text-slate-500 mt-1">Point the ESP32 at this server's IP address on this port.</p>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
@@ -1309,7 +1330,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const finalDist = Math.max(0.5, dist);
 
       document.getElementById('floorLabelText').innerText = 'Floor ' + floor + ' (~' + height.toFixed(0) + 'm height)';
-      document.getElementById('setbackLabelText').innerText = setback.toFixed(1) + ' m';
+      const setbackSlider = document.getElementById('cfgSetbackSlider');
+      if (setbackSlider) setbackSlider.value = Math.min(setback, parseFloat(setbackSlider.max));
       document.getElementById('triangulatedDistText').innerText = finalDist.toFixed(1) + ' meters';
 
       const loss = 20 * Math.log10(finalDist / 0.5);
@@ -1878,9 +1900,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         construction: '🏗️ Construction',
         weather: '🌧️ Weather',
         bbq: '🍖 BBQ',
+        impulse: '💥 Impulse',
         misc: '❓ Misc',
         review: '⚠️ Review'
       };
+      // One list drives the per-event dropdown; aliases map to their canonical tag, and any
+      // other tag gets its own option instead of silently showing as the first one
+      const TAG_ALIASES = { vehicle: 'traffic', bus: 'ets', patio: 'bbq' };
+      const TAG_OPTIONS = ['traffic', 'ets', 'bbq', 'siren', 'construction', 'weather', 'impulse', 'misc', 'review'];
 
       const trafficEvents = allEvents.filter(e => {
         const t = (e.tag || '').toLowerCase();
@@ -1962,29 +1989,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
 
       tbody.innerHTML = pageEvents.map((ev, idx) => {
-        const isTraffic = ev.tag === 'traffic' || ev.tag === 'vehicle';
         const isEts = ev.tag === 'ets' || ev.tag === 'bus';
         const isBbq = ev.tag === 'bbq' || ev.tag === 'patio';
-        const isSiren = ev.tag === 'siren';
-        const isConst = ev.tag === 'construction';
-        const isWeather = ev.tag === 'weather';
-        const isMisc = ev.tag === 'misc';
-        const isReview = ev.tag === 'review';
         const tagLabel = tagLabels[ev.tag] || `🏷️ ${ev.tag}`;
+        const canonTag = TAG_ALIASES[(ev.tag || '').toLowerCase()] || (ev.tag || '').toLowerCase();
+        const tagOptions = [...TAG_OPTIONS, ...(TAG_OPTIONS.includes(canonTag) ? [] : [canonTag])]
+          .map(t => `<option value="${t}" ${t === canonTag ? 'selected' : ''}>${tagLabels[t] || `🏷️ ${t}`}</option>`).join('');
         const curDist = (loadedConfig && loadedConfig.distance_to_road_meters) ? loadedConfig.distance_to_road_meters : 7.0;
         const lossDb = 20 * Math.log10(Math.max(0.5, curDist) / 0.5);
         const tailpipeDba = (ev.dba !== undefined && ev.dba !== null) ? (Math.round((ev.dba + lossDb) * 10) / 10) : ((ev.tailpipe_dba !== undefined && ev.tailpipe_dba !== null) ? ev.tailpipe_dba : '--');
 
         const classificationCell = isAdmin ? `
           <select onchange="reclassifyEvent('${ev.filename}', this.value)" class="bg-white border-2 border-indigo-200 hover:border-indigo-400 text-xs font-bold text-slate-800 rounded-lg px-2.5 py-1.5 cursor-pointer shadow-sm focus:ring-2 focus:ring-indigo-500 transition">
-            <option value="traffic" ${isTraffic ? 'selected' : ''}>🚗 Traffic</option>
-            <option value="ets" ${isEts ? 'selected' : ''}>🚌 ETS</option>
-            <option value="bbq" ${isBbq ? 'selected' : ''}>🍖 BBQ</option>
-            <option value="siren" ${isSiren ? 'selected' : ''}>🚨 Siren</option>
-            <option value="construction" ${isConst ? 'selected' : ''}>🏗️ Construction</option>
-            <option value="weather" ${isWeather ? 'selected' : ''}>🌧️ Weather</option>
-            <option value="misc" ${isMisc ? 'selected' : ''}>❓ Misc</option>
-            <option value="review" ${isReview ? 'selected' : ''}>⚠️ Review</option>
+            ${tagOptions}
           </select>
         ` : `
           <span class="px-2.5 py-1 ${isEts ? 'bg-sky-50 text-sky-800 border-sky-200' : isBbq ? 'bg-amber-100 text-amber-900 border-amber-300' : 'bg-slate-100 text-slate-700 border-slate-200'} border rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 shadow-xs">
@@ -2221,13 +2238,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           calculateTriangulation();
           renderEvents();
           updateStationBranding(loadedConfig.station_name || loadedConfig.location_name, loadedConfig.street_name, loadedConfig.location_name, fNum, sMeters);
-          document.getElementById('cfgThreshold').value = loadedConfig.threshold_dba || 75;
+          document.getElementById('cfgThreshold').value = loadedConfig.threshold_dba || 70;
           document.getElementById('cfgOffset').value = loadedConfig.calibration_offset || 50;
 
           const devSelect = document.getElementById('cfgAudioDevice');
           if (devSelect && loadedConfig.audio_device_index !== null && loadedConfig.audio_device_index !== undefined) {
             devSelect.value = loadedConfig.audio_device_index;
           }
+
+          const src = loadedConfig.audio_source || {};
+          document.getElementById('cfgAudioSource').value = ['rtsp', 'udp'].includes(src.type) ? src.type : 'pyaudio';
+          document.getElementById('cfgRtspUrl').value = src.url || '';
+          document.getElementById('cfgUdpPort').value = src.port || 5005;
+          updateAudioSourceFields();
 
           document.getElementById('cfgBlueskyEnabled').checked = loadedConfig.bluesky?.enabled || false;
           document.getElementById('cfgBlueskyHandle').value = loadedConfig.bluesky?.handle || '';
@@ -2252,7 +2275,36 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    function updateAudioSourceFields() {
+      const type = document.getElementById('cfgAudioSource').value;
+      document.getElementById('srcFieldsPyaudio').classList.toggle('hidden', type !== 'pyaudio');
+      document.getElementById('srcFieldsRtsp').classList.toggle('hidden', type !== 'rtsp');
+      document.getElementById('srcFieldsUdp').classList.toggle('hidden', type !== 'udp');
+    }
+
+    function readAudioSourceFields() {
+      const type = document.getElementById('cfgAudioSource').value;
+      const url = document.getElementById('cfgRtspUrl').value.trim();
+      const port = parseInt(document.getElementById('cfgUdpPort').value);
+      if (type === 'rtsp' && !['rtsp://', 'rtsps://'].some(pfx => url.toLowerCase().startsWith(pfx))) throw new Error('Enter an RTSP stream URL starting with rtsp:// or rtsps://');
+      if (type === 'udp' && !(port >= 1 && port <= 65535)) throw new Error('Enter a UDP port between 1 and 65535');
+      // Keep keys for the other sources so switching back doesn't lose them
+      return {
+        ...(loadedConfig.audio_source || {}),
+        type,
+        url,
+        port: port >= 1 && port <= 65535 ? port : 5005
+      };
+    }
+
     async function saveSettings() {
+      let audioSource;
+      try {
+        audioSource = readAudioSourceFields();
+      } catch (eSrc) {
+        alert(eSrc.message);
+        return;
+      }
       const codeInp = document.getElementById('adminPasscode');
       const code = (codeInp && codeInp.value ? codeInp.value.trim() : '') || sessionStorage.getItem('station_admin_passcode') || currentAdminPasscode || '1811';
       const devVal = document.getElementById('cfgAudioDevice') ? document.getElementById('cfgAudioDevice').value : '';
@@ -2270,6 +2322,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         horizontal_setback_meters: sMeters,
         distance_to_road_meters: finalDist,
         audio_device_index: devVal !== "" ? parseInt(devVal) : null,
+        audio_source: audioSource,
         threshold_dba: parseFloat(document.getElementById('cfgThreshold').value),
         calibration_offset: parseFloat(document.getElementById('cfgOffset').value),
         bluesky: {

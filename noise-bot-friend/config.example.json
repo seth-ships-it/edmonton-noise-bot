@@ -7,10 +7,19 @@
   "horizontal_setback_meters": 5.0,
   "distance_to_road_meters": 7.8,
   "audio_device_index": null,
+  "audio_source": {
+    "type": "pyaudio",
+    "url": "",
+    "port": 5005,
+    "calibrated_wav_reference_db": 100.0
+  },
   "threshold_dba": 70,
   "calibration_offset": 95,
   "cooldown_period_minutes": 2,
   "record_event_seconds": 8,
+  "max_event_seconds": 30,
+  "event_tail_seconds": 2,
+  "detect_ets": true,
   "save_audio_files": true,
   "output_directory": "./recordings",
   "fleet_hub": {

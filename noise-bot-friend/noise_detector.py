@@ -30,6 +30,7 @@ except ImportError:
 
 from notifier import Notifier
 from audio_classifier import classify_audio
+from calibrated_wav import write_calibrated_wav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "noise_bot.log")
@@ -145,9 +146,58 @@ def get_hardware_station_id(cfg=None):
         pass
     return "noise-bot-station"
 
+def event_time_from_filename(filename):
+    """Event time (epoch) from noise_event_YYYYMMDD_HHMMSS_..., which is stamped in UTC; None if absent."""
+    m = re.match(r"noise_event_(\d{8})_(\d{6})_", os.path.basename(filename))
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+# Upload bookkeeping lives next to the recordings (a mounted volume), so container updates don't
+# trigger a full re-upload. Entries are event IDs, so re-tagging (which renames the file) doesn't
+# upload the event again.
+UPLOAD_STATE_FILE = os.path.join(OUTPUT_DIR, ".uploaded_recordings.json")
+LEGACY_UPLOAD_STATE_FILE = os.path.join(BASE_DIR, ".uploaded_recordings.json")
+_upload_lock = threading.Lock()
+_uploads_in_flight = set()
+
+def recording_event_id(filename):
+    m = re.match(r"(noise_event_\d{8}_\d{6})_", os.path.basename(filename))
+    return m.group(1) if m else os.path.basename(filename)
+
+def load_uploaded_event_ids():
+    ids = set()
+    for path in (LEGACY_UPLOAD_STATE_FILE, UPLOAD_STATE_FILE):
+        try:
+            with open(path, "r") as f:
+                ids.update(recording_event_id(name) for name in json.load(f))
+        except Exception:
+            pass
+    return ids
+
+def mark_event_uploaded(filename):
+    with _upload_lock:
+        ids = load_uploaded_event_ids()
+        ids.add(recording_event_id(filename))
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(UPLOAD_STATE_FILE, "w") as f:
+                json.dump(sorted(ids)[-25000:], f)  # event IDs sort chronologically
+        except Exception as e:
+            logging.error(f"Failed to save upload state: {e}")
+
 def upload_recording_to_hub(wav_path, event_meta):
     if not wav_path or not os.path.exists(wav_path):
         return
+    event_id = recording_event_id(wav_path)
+    with _upload_lock:
+        # The live upload and the backlog sync can race for the same event; upload it once
+        if event_id in _uploads_in_flight or event_id in load_uploaded_event_ids():
+            return True
+        _uploads_in_flight.add(event_id)
     try:
         import base64
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -173,7 +223,8 @@ def upload_recording_to_hub(wav_path, event_meta):
             "tailpipe_dba": float(event_meta.get("tailpipe_dba", 95.0)),
             "tag": event_meta.get("tag", "traffic"),
             "audio_b64": audio_b64,
-            "timestamp": time.time()
+            # When the event happened, not when it was uploaded (matters for backlog uploads)
+            "timestamp": event_time_from_filename(filename) or time.time()
         }
         
         endpoint = f"{hub_url}/api/recordings/upload"
@@ -185,12 +236,16 @@ def upload_recording_to_hub(wav_path, event_meta):
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             if resp.status in [200, 201]:
+                mark_event_uploaded(filename)
                 logging.info(f"Uploaded audio {filename} to Central Hub ({len(wav_bytes)} bytes)")
                 return True
         return False
     except Exception as e:
         logging.error(f"Failed to upload audio to Central Hub: {e}")
         return False
+    finally:
+        with _upload_lock:
+            _uploads_in_flight.discard(event_id)
 
 def sync_unuploaded_recordings():
     if not os.path.exists(OUTPUT_DIR):
@@ -205,21 +260,12 @@ def sync_unuploaded_recordings():
         if not hub_url or not hub_url.startswith("http"):
             return
 
-        sync_state_file = os.path.join(BASE_DIR, ".uploaded_recordings.json")
-        uploaded = set()
-        if os.path.exists(sync_state_file):
-            try:
-                with open(sync_state_file, "r") as f:
-                    uploaded = set(json.load(f))
-            except Exception:
-                pass
-
+        uploaded = load_uploaded_event_ids()
         wav_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith(".wav") and not f.endswith("_temp.wav")])
-        unuploaded = [f for f in wav_files if f not in uploaded]
+        unuploaded = [f for f in wav_files if recording_event_id(f) not in uploaded]
         if not unuploaded:
             return
 
-        new_uploaded = False
         # Take batch of newest first, plus some older if backlog exists
         batch = unuploaded[-10:]
         if len(unuploaded) > 10:
@@ -234,19 +280,8 @@ def sync_unuploaded_recordings():
             loss = 20 * np.log10(max(0.5, dist) / 0.5)
             tailpipe = round(dba_val + loss, 1)
 
-            ok = upload_recording_to_hub(full_path, {"dba": dba_val, "tailpipe_dba": tailpipe, "tag": tag_val})
-            if ok:
-                uploaded.add(f)
-                new_uploaded = True
+            upload_recording_to_hub(full_path, {"dba": dba_val, "tailpipe_dba": tailpipe, "tag": tag_val})
             time.sleep(0.3)
-
-        if new_uploaded:
-            try:
-                with open(sync_state_file, "w") as f:
-                    # Persist up to 25,000 uploaded filenames
-                    json.dump(list(uploaded)[-25000:], f)
-            except Exception:
-                pass
     except Exception as e:
         logging.error(f"Error in recording sync loop: {e}")
 
@@ -358,6 +393,10 @@ def main():
     calibration_offset = args.offset or config.get("calibration_offset") or 95.0
     cooldown_period = (config.get("cooldown_period_minutes") or 2) * 60
     record_seconds = config.get("record_event_seconds") or 8
+    # Events last at least record_seconds; a sound that keeps going extends the recording until
+    # it has been below the threshold for event_tail_seconds, up to max_event_seconds in total
+    max_event_seconds = float(config.get("max_event_seconds") or 30)
+    event_tail_seconds = float(config.get("event_tail_seconds") or 2)
     save_audio = config.get("save_audio_files") if config.get("save_audio_files") is not None else True
     output_dir = config.get("output_directory") or OUTPUT_DIR
     device_index = args.device if args.device is not None else config.get("audio_device_index", None)
@@ -367,88 +406,114 @@ def main():
     b, a = get_a_weighting_coefficients(RATE)
     filter_state = signal.lfilter_zi(b, a) * 0 if (HAS_SCIPY and b is not None) else None
 
-    p = pyaudio.PyAudio()
-
-    stream = None
-    target_device = None
-    channels = 1
-    p_dev_count = p.get_device_count()
-
-    # Priority 1: Specifically search PyAudio input devices for Yeti
-    for i in range(p_dev_count):
+    audio_source = config.get("audio_source") or {}
+    # Save events as float WAVs scaled so 0 dBFS (A-weighted RMS) = reference dB(A), using the
+    # same calibration_offset as the meter; "calibrated_wav": false keeps raw 16-bit WAVs.
+    calibrated_wav = audio_source.get("calibrated_wav", True)
+    calibrated_wav_reference_db = float(audio_source.get("calibrated_wav_reference_db", 100.0))
+    if audio_source.get("type") == "rtsp":
+        from rtsp_source import RTSPAudioSource
+        p = None
+        channels = 1
         try:
-            info = p.get_device_info_by_index(i)
-            dev_name = (info.get("name") or "").lower()
-            ch = int(info.get("maxInputChannels", 0))
-            if ch > 0 and "yeti" in dev_name:
-                target_device = i
-                channels = min(2, max(1, ch))
-                logging.info(f"Selected Yeti microphone: [{i}] {info.get('name')} ({channels} channels)")
-                break
-        except Exception:
-            pass
-
-    # Priority 2: If no Yeti, check explicit device_index from config
-    if target_device is None and device_index is not None and str(device_index).lower() not in ["null", "none", "yeti"]:
+            stream = RTSPAudioSource(audio_source.get("url", ""), rate=RATE)
+        except Exception as e:
+            logging.error(f"Critical audio initialization error: {e}")
+            return
+        logging.info(f"Using RTSP audio source {stream.safe_url} ({channels} channel, {RATE} Hz)")
+    elif audio_source.get("type") == "udp":
+        from udp_source import UdpAudioSource
+        p = None
+        channels = 1
         try:
-            info = p.get_device_info_by_index(int(device_index))
-            if info.get("maxInputChannels", 0) > 0:
-                target_device = int(device_index)
-                channels = min(2, max(1, int(info.get("maxInputChannels", 1))))
-        except Exception:
-            pass
-        if target_device is None:
-            hw_str = f"hw:{device_index},"
-            for i in range(p_dev_count):
-                try:
-                    info = p.get_device_info_by_index(i)
-                    if hw_str in (info.get("name") or "") and info.get("maxInputChannels", 0) > 0:
-                        target_device = i
-                        channels = min(2, max(1, int(info.get("maxInputChannels", 1))))
-                        break
-                except Exception:
-                    pass
+            stream = UdpAudioSource(port=int(audio_source.get("port", 5005)))
+        except Exception as e:
+            logging.error(f"Critical audio initialization error: {e}")
+            return
+        logging.info(f"Using ESP32 UDP audio source on port {audio_source.get('port', 5005)} ({channels} channel, {RATE} Hz)")
+    else:
+        p = pyaudio.PyAudio()
 
-    # Priority 3: Fallback to any USB / mic device
-    if target_device is None:
+        stream = None
+        target_device = None
+        channels = 1
+        p_dev_count = p.get_device_count()
+
+        # Priority 1: Specifically search PyAudio input devices for Yeti
         for i in range(p_dev_count):
             try:
                 info = p.get_device_info_by_index(i)
                 dev_name = (info.get("name") or "").lower()
                 ch = int(info.get("maxInputChannels", 0))
-                if ch > 0 and any(k in dev_name for k in ["usb", "mic", "streaming"]):
+                if ch > 0 and "yeti" in dev_name:
                     target_device = i
                     channels = min(2, max(1, ch))
-                    logging.info(f"Auto-selected microphone: [{i}] {info.get('name')} ({channels} channels)")
+                    logging.info(f"Selected Yeti microphone: [{i}] {info.get('name')} ({channels} channels)")
                     break
             except Exception:
                 pass
 
-    try:
-        stream = p.open(
-            format=FORMAT,
-            channels=channels,
-            rate=RATE,
-            input=True,
-            input_device_index=target_device,
-            frames_per_buffer=CHUNK
-        )
-        logging.info(f"Opened audio input stream on Device {target_device} ({channels} channels, {RATE} Hz)")
-    except Exception as e:
-        logging.warning(f"Failed to open audio device {target_device} with {channels} ch: {e}. Retrying default...")
+        # Priority 2: If no Yeti, check explicit device_index from config
+        if target_device is None and device_index is not None and str(device_index).lower() not in ["null", "none", "yeti"]:
+            try:
+                info = p.get_device_info_by_index(int(device_index))
+                if info.get("maxInputChannels", 0) > 0:
+                    target_device = int(device_index)
+                    channels = min(2, max(1, int(info.get("maxInputChannels", 1))))
+            except Exception:
+                pass
+            if target_device is None:
+                hw_str = f"hw:{device_index},"
+                for i in range(p_dev_count):
+                    try:
+                        info = p.get_device_info_by_index(i)
+                        if hw_str in (info.get("name") or "") and info.get("maxInputChannels", 0) > 0:
+                            target_device = i
+                            channels = min(2, max(1, int(info.get("maxInputChannels", 1))))
+                            break
+                    except Exception:
+                        pass
+
+        # Priority 3: Fallback to any USB / mic device
+        if target_device is None:
+            for i in range(p_dev_count):
+                try:
+                    info = p.get_device_info_by_index(i)
+                    dev_name = (info.get("name") or "").lower()
+                    ch = int(info.get("maxInputChannels", 0))
+                    if ch > 0 and any(k in dev_name for k in ["usb", "mic", "streaming"]):
+                        target_device = i
+                        channels = min(2, max(1, ch))
+                        logging.info(f"Auto-selected microphone: [{i}] {info.get('name')} ({channels} channels)")
+                        break
+                except Exception:
+                    pass
+
         try:
-            channels = 1
             stream = p.open(
                 format=FORMAT,
                 channels=channels,
                 rate=RATE,
                 input=True,
+                input_device_index=target_device,
                 frames_per_buffer=CHUNK
             )
-        except Exception as e2:
-            logging.error(f"Critical audio initialization error: {e2}")
-            p.terminate()
-            return
+            logging.info(f"Opened audio input stream on Device {target_device} ({channels} channels, {RATE} Hz)")
+        except Exception as e:
+            logging.warning(f"Failed to open audio device {target_device} with {channels} ch: {e}. Retrying default...")
+            try:
+                channels = 1
+                stream = p.open(
+                    format=FORMAT,
+                    channels=channels,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK
+                )
+            except Exception as e2:
+                logging.error(f"Critical audio initialization error: {e2}")
+                p.terminate()
+                return
 
     logging.info(f"Noise detector running. Threshold: {threshold_dba} dBA, Calibration: {calibration_offset} dB")
 
@@ -456,6 +521,8 @@ def main():
     post_trigger_seconds = record_seconds - pre_trigger_seconds
     pre_trigger_chunks = int((RATE / CHUNK) * pre_trigger_seconds)
     post_trigger_chunks = int((RATE / CHUNK) * post_trigger_seconds)
+    tail_chunks = max(1, int((RATE / CHUNK) * event_tail_seconds))
+    max_event_chunks = int((RATE / CHUNK) * max(max_event_seconds, record_seconds))
 
     audio_history = deque(maxlen=pre_trigger_chunks)
     is_recording_event = False
@@ -463,6 +530,7 @@ def main():
     event_peak_dba = 0.0
     event_start_time = 0.0
     post_trigger_count = 0
+    chunks_since_loud = 0
     last_notification_time = 0.0
     last_state_write_time = 0.0
 
@@ -529,13 +597,18 @@ def main():
                     event_peak_dba = dba
                     event_frames = list(audio_history)
                     post_trigger_count = 0
+                    chunks_since_loud = 0
             else:
                 event_frames.append(data)
                 post_trigger_count += 1
                 if dba > event_peak_dba:
                     event_peak_dba = dba
+                chunks_since_loud = 0 if dba >= threshold_dba else chunks_since_loud + 1
 
-                if post_trigger_count >= post_trigger_chunks:
+                hit_max_length = len(event_frames) >= max_event_chunks
+                if hit_max_length or (post_trigger_count >= post_trigger_chunks and chunks_since_loud >= tail_chunks):
+                    if hit_max_length:
+                        logging.info(f"Event reached the {max_event_seconds:.0f}s maximum length")
                     is_recording_event = False
                     last_notification_time = current_time
                     wav_path = None
@@ -548,14 +621,23 @@ def main():
 
                         try:
                             os.makedirs(output_dir, exist_ok=True)
-                            wf = wave.open(temp_path, 'wb')
-                            wf.setnchannels(channels)
-                            wf.setsampwidth(p.get_sample_size(FORMAT))
-                            wf.setframerate(RATE)
-                            wf.writeframes(b''.join(event_frames))
-                            wf.close()
+                            if calibrated_wav:
+                                write_calibrated_wav(temp_path, b''.join(event_frames), channels, RATE,
+                                                     calibration_offset, calibrated_wav_reference_db)
+                            else:
+                                wf = wave.open(temp_path, 'wb')
+                                wf.setnchannels(channels)
+                                wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
+                                wf.setframerate(RATE)
+                                wf.writeframes(b''.join(event_frames))
+                                wf.close()
 
                             tag = classify_audio(temp_path)
+                            # The ETS test relies on a bus being a long steady drone among short car
+                            # passes; far from the road ordinary traffic blends into one, so stations
+                            # can opt out with "detect_ets": false
+                            if tag == "ets" and not config.get("detect_ets", True):
+                                tag = "vehicle"
                             final_filename = f"noise_event_{timestamp}_{int(event_peak_dba)}dba_{tag}.wav"
                             wav_path = os.path.join(output_dir, final_filename)
                             os.rename(temp_path, wav_path)
@@ -564,7 +646,7 @@ def main():
                             logging.error(f"Failed to save WAV file: {e}")
                             wav_path = None
 
-                    duration = post_trigger_seconds + pre_trigger_seconds
+                    duration = round(len(event_frames) * CHUNK / RATE, 1)
                     logging.info(f"Processing event: Peak {event_peak_dba:.1f} dBA, Duration {duration}s")
                     
                     # Run network notification in background thread so audio capture never blocks
@@ -599,7 +681,8 @@ def main():
         if stream:
             stream.stop_stream()
             stream.close()
-        p.terminate()
+        if p:
+            p.terminate()
 
 if __name__ == "__main__":
     main()
