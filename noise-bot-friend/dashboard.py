@@ -59,6 +59,31 @@ FLEET_DB_FILE = os.path.join(BASE_DIR, "fleet_database.json")
 
 ALLOWED_TAGS = ["traffic", "vehicle", "ets", "weather", "siren", "construction", "misc", "review"]
 
+def archived_catalog(cfg):
+    """Validated index of hub copies; never counts as local audio storage."""
+    try:
+        path = Path(BASE_DIR)/'.archive-retention'/'catalog.json'
+        if path.stat().st_size > 4*1024*1024:
+            return {}, ''
+        data = json.loads(path.read_text(encoding='utf-8'))
+        fleet = cfg.get('fleet_hub', {})
+        base = fleet.get('hub_url', '').rstrip('/')
+        station = fleet.get('station_id', '')
+        parsed = urllib.parse.urlsplit(base)
+        if (data.get('schema') != 1 or data.get('station_id') != station or data.get('hub_url') != base
+                or not re.fullmatch(r'noise-bot-[a-z0-9-]+', station)
+                or parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.username or parsed.password):
+            return {}, ''
+        rows = data['events']
+        if not isinstance(rows, dict) or len(rows) > 20000:
+            return {}, ''
+        valid = {name: stamp for name, stamp in rows.items()
+                 if re.fullmatch(r'noise_event_\d{8}_\d{6}_\d+dba_[a-zA-Z0-9_-]+\.wav', name)
+                 and not name.endswith('_temp.wav') and isinstance(stamp, (int, float)) and math.isfinite(stamp)}
+        return valid, base+'/'+station.removeprefix('noise-bot-')+'/recordings/'
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}, ''
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -281,6 +306,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             return events
 
+        local_names = set(filenames)
+        archived, archive_base = archived_catalog(cfg)
+        filenames.extend(name for name in archived if name not in local_names)
+
         for filename in filenames:
             match = pattern.match(filename)
             if match:
@@ -291,7 +320,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 f_path = os.path.join(RECORDINGS_DIR, filename)
                 try:
                     # Use file mtime in Edmonton timezone for 100% accurate local time display
-                    file_mtime = os.path.getmtime(f_path)
+                    file_mtime = os.path.getmtime(f_path) if filename in local_names else archived[filename]
                     dt_local = datetime.fromtimestamp(file_mtime, tz=EDMONTON_TZ)
                     local_date = dt_local.strftime("%Y-%m-%d")
                     local_time_fmt = dt_local.strftime("%I:%M %p").lstrip("0")
@@ -313,7 +342,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 dba_val = int(dba_str)
                 tailpipe_dba = round(dba_val + loss, 1)
                 events.append({
-                    "event_metadata": read_metadata(os.path.join(RECORDINGS_DIR, filename)),
+                    "event_metadata": read_metadata(os.path.join(RECORDINGS_DIR, filename)) if filename in local_names else None,
+                    "archive_only": filename not in local_names,
                     "filename": filename,
                     "date": local_date,
                     "time": local_time_fmt,
@@ -321,7 +351,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "dba": dba_val,
                     "tailpipe_dba": tailpipe_dba,
                     "tag": tag,
-                    "url": f"/recordings/{filename}"
+                    "url": f"/recordings/{filename}" if filename in local_names else archive_base+urllib.parse.quote(filename)
                 })
         events.sort(key=lambda x: x["datetime"], reverse=True)
         _EVENTS_CACHE = events
@@ -500,6 +530,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.send_error(500, "Error reading audio file")
                     return
             else:
+                archived, archive_base = archived_catalog(load_config())
+                if filename in archived:
+                    self.send_response(302)
+                    self.send_header('Location', archive_base+urllib.parse.quote(filename))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
+                    return
                 self.send_error(404, "File not found")
                 return
 
@@ -2037,7 +2074,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const lossDb = 20 * Math.log10(Math.max(0.5, curDist) / 0.5);
         const tailpipeDba = (ev.dba !== undefined && ev.dba !== null) ? (Math.round((ev.dba + lossDb) * 10) / 10) : ((ev.tailpipe_dba !== undefined && ev.tailpipe_dba !== null) ? ev.tailpipe_dba : '--');
 
-        const classificationCell = isAdmin ? `
+        const classificationCell = isAdmin && !ev.archive_only ? `
           <select onchange="reclassifyEvent('${ev.filename}', this.value)" class="bg-white border-2 border-indigo-200 hover:border-indigo-400 text-xs font-bold text-slate-800 rounded-lg px-2.5 py-1.5 cursor-pointer shadow-sm focus:ring-2 focus:ring-indigo-500 transition">
             <option value="traffic" ${isTraffic ? 'selected' : ''}>🚗 Traffic</option>
             <option value="ets" ${isEts ? 'selected' : ''}>🚌 ETS</option>
@@ -2054,7 +2091,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </span>
         `;
 
-        const actionCell = isAdmin ? `
+        const actionCell = isAdmin && ev.archive_only ? '<td class="py-1.5 px-4 text-right text-xs text-slate-500">Archived on hub</td>' : isAdmin ? `
           <td class="py-1.5 px-4 text-right">
             <button onclick="deleteEvent('${ev.filename}')" class="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-rose-50 hover:bg-rose-600 text-rose-600 hover:text-white border border-rose-200 hover:border-rose-600 shadow-sm transition" title="Delete Recording">
               <i class="fa-solid fa-trash text-sm"></i>

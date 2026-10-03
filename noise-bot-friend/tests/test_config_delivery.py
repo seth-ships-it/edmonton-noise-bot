@@ -113,7 +113,7 @@ class ConfigDeliveryTests(unittest.TestCase):
             get_hardware_station_id=lambda cfg:'noise-bot-03',wifi_network_id=lambda _:None,
             apply_config_patch=apply_config_patch, read_config=read_config,
             urllib=SimpleNamespace(request=SimpleNamespace(Request=urllib.request.Request,urlopen=urlopen)))
-        load_functions(APP/'noise_detector.py',{'send_fleet_heartbeat'},ns)
+        load_functions(APP/'noise_detector.py',{'recording_count','send_fleet_heartbeat'},ns)
         ns['send_fleet_heartbeat']();ns['send_fleet_heartbeat']()
         self.assertEqual(sent[-1]['config_update_ack'],'a')
         self.assertEqual(sent[-1]['horizontal_setback_meters'],35)

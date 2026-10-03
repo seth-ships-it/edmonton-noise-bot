@@ -267,6 +267,31 @@ def sync_unuploaded_recordings():
     except Exception as e:
         logging.error(f"Error in recording sync loop: {e}")
 
+_ARCHIVE_NAMES_CACHE = {'key': None, 'names': frozenset()}
+
+
+def recording_count(cfg):
+    """Count local and archived clips once, so retention does not erase totals."""
+    local = {name for name in os.listdir(OUTPUT_DIR) if name.endswith('.wav') and not name.endswith('_temp.wav')} if os.path.isdir(OUTPUT_DIR) else set()
+    catalog_path = os.path.join(BASE_DIR, '.archive-retention', 'catalog.json')
+    archived = frozenset()
+    try:
+        info = os.stat(catalog_path)
+        fleet = cfg.get('fleet_hub', {})
+        key = (catalog_path, info.st_mtime_ns, info.st_size, fleet.get('station_id'), fleet.get('hub_url', '').rstrip('/'))
+        if info.st_size <= 4*1024*1024:
+            if _ARCHIVE_NAMES_CACHE['key'] != key:
+                with open(catalog_path, encoding='utf-8') as f:
+                    data = json.load(f)
+                if data.get('schema') == 1 and data.get('station_id') == key[3] and data.get('hub_url') == key[4] and len(data.get('events', {})) <= 20000:
+                    archived = frozenset(name for name in data['events'] if re.fullmatch(r'noise_event_\d{8}_\d{6}_\d+dba_[a-zA-Z0-9_-]+\.wav', name))
+                _ARCHIVE_NAMES_CACHE.update(key=key, names=archived)
+            archived = _ARCHIVE_NAMES_CACHE['names']
+    except (OSError, ValueError, TypeError):
+        pass
+    return len(local | archived)
+
+
 def send_fleet_heartbeat(event_payload=None):
     if not os.path.exists(CONFIG_FILE):
         return
@@ -286,9 +311,7 @@ def send_fleet_heartbeat(event_payload=None):
                 live = json.load(f)
                 live_dba = live.get("current_dba", 0.0)
 
-        total_events = 0
-        if os.path.exists(OUTPUT_DIR):
-            total_events = len([f for f in os.listdir(OUTPUT_DIR) if f.endswith(".wav")])
+        total_events = recording_count(cfg)
 
         station_id = get_hardware_station_id(cfg)
 

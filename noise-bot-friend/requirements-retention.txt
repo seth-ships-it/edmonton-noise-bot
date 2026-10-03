@@ -1,0 +1,2 @@
+# Hub-side verifier only; no new Pi Python dependencies.
+paramiko==5.0.0

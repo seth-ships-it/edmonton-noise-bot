@@ -15,6 +15,7 @@ services:
       - ./config.json:/app/config.json
       - ./recordings:/app/recordings
       - ./adaptive-data:/app/adaptive-data
+      - ./.archive-retention:/app/.archive-retention
       - ./noise_bot.log:/app/noise_bot.log
       - ./live_audio_state.json:/app/live_audio_state.json
       - ./fleet_database.json:/app/fleet_database.json

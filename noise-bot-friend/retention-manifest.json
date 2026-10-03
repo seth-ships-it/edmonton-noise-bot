@@ -1,0 +1,13 @@
+{
+  "release": "2026.10.03-retention.1",
+  "files": {
+    "archive_retention.py": "d716efc706b9c759a190cc40c902d05fa3fcd9c12a56f509c96a8b542eaa2814",
+    "retention_agent.py": "47939969bec9586985ecbf7dde8ea5b8ea1e7f0965261588aed8fc98755264f1",
+    "dashboard.py": "2107489208294cb06df385bf1787cd86c13c4f95e37fb862451e01aa07ed38db",
+    "noise_detector.py": "0ebc9071b0d59dc8da5fa03d2cb35fed571e3026c4dabec69084ae757e61fc6a",
+    "install_retention_task.ps1": "b44a0cddbedf4dbab3225a490513a5c518454392b501f691ac89e922f4d0fb80",
+    "requirements-retention.txt": "d2d667a61b9c44d18035c1b88da169386d05d5bda34a28ebae5f970aeaca4ac5",
+    "RETENTION.md": "ae6bb53c08f85d03854af71f3a01424c3d3de70b0465a6e6bcf41cad7f59a26e",
+    "docker-compose.yml": "ccb92c1a979a43205eeece2ae331c481866e879d954d30941658a29825cfc0aa"
+  }
+}
