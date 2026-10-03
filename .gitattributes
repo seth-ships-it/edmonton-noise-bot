@@ -3,3 +3,6 @@
 *.py text eol=lf
 *.yml text eol=lf
 *.json text eol=lf
+*.ps1 text eol=lf
+noise-bot-friend/RETENTION.md text eol=lf
+noise-bot-friend/requirements-retention.txt text eol=lf
