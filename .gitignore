@@ -13,3 +13,6 @@ live_audio_state.json
 fleet_database.json
 .DS_Store
 Thumbs.db
+adaptive-data/
+config.json
+*.event.json

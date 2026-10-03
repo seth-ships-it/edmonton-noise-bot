@@ -78,6 +78,9 @@ def apply_config_patch(path, patch, revision=None):
     with config_lock(path):
         current = json.loads(path.read_text(encoding='utf-8'))
         updated = merge_values(current, patch)
+        if 'adaptive_detection' in patch:
+            from adaptive_detector import settings
+            updated['adaptive_detection'] = settings(updated['adaptive_detection'])
         if 'floor_number' in patch or 'horizontal_setback_meters' in patch:
             floor = float(updated.get('floor_number', 1))
             setback = float(updated.get('horizontal_setback_meters', 5))

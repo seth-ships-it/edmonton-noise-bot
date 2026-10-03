@@ -1,4 +1,5 @@
 {
+  "adaptive_detection": {"mode": "off", "timezone": "America/Edmonton"},
   "admin_passcode": "1811",
   "location_name": "Community Station",
   "street_name": "Edmonton Corridor",
