@@ -1,0 +1,14 @@
+{
+  "release": "2026.10.03-shadow.1",
+  "files": {
+    "adaptive_detector.py": "6922f80405720cf010cfbf5623ef33cee379ca4213bd743ec9441e532d140671",
+    "adaptive_runtime.py": "94f1149934bb25cec70e1579a55fb2c612a6721c6eff809c74724aa9ea886c83",
+    "adaptive_report.py": "b3033a28448ec155b123bbe25aa0059456fce56cc922b59c5d95edc4474411bf",
+    "audio_classifier.py": "5ed14bf09e000bf64450a68900945da263cbe4edd986995dd899e8ac896f4b75",
+    "event_metadata.py": "2fd0461fc824f14a8b359201eecfb556644e4388cad9d64e52af140965cc72ad",
+    "config_store.py": "9587ef15e37cdf7d1e6a4b9e758b3862fe510d9e661e4087d41848f38a8ad819",
+    "station_network.py": "001573eaa13c5a3a5cb84baa294f6955bd2f990cab312a3db59c0ad0aecfde6d",
+    "noise_detector.py": "4bb308fd2b67e61e5cf7ede725f7aef33e6d7ba6d1833d8969f594ad6c8f2ab8",
+    "dashboard.py": "2df7014ad228343e1c6efbb45fba78d56128c3338a55fa2b819b684c9829a185"
+  }
+}

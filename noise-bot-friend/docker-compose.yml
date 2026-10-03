@@ -14,12 +14,19 @@ services:
     volumes:
       - ./config.json:/app/config.json
       - ./recordings:/app/recordings
+      - ./adaptive-data:/app/adaptive-data
       - ./noise_bot.log:/app/noise_bot.log
       - ./live_audio_state.json:/app/live_audio_state.json
       - ./fleet_database.json:/app/fleet_database.json
       - ./noise_detector.py:/app/noise_detector.py
       - ./dashboard.py:/app/dashboard.py
       - ./config_store.py:/app/config_store.py
+      - ./adaptive_detector.py:/app/adaptive_detector.py
+      - ./adaptive_runtime.py:/app/adaptive_runtime.py
+      - ./adaptive_report.py:/app/adaptive_report.py
+      - ./event_metadata.py:/app/event_metadata.py
+      - ./audio_classifier.py:/app/audio_classifier.py
+      - ./station_network.py:/app/station_network.py
       - ./notifier.py:/app/notifier.py
     environment:
       - PORT=5000

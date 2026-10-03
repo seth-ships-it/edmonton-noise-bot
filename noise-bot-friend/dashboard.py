@@ -1,4 +1,8 @@
 import os
+import hmac
+from pathlib import Path
+from adaptive_report import load_report as load_adaptive_report, HTML as ADAPTIVE_HTML
+from event_metadata import retag_metadata, delete_metadata, read_metadata
 from config_store import apply_config_patch, read_config
 import re
 import sys
@@ -80,6 +84,13 @@ def load_config():
 
 def save_config(new_config):
     return apply_config_patch(CONFIG_FILE, new_config)[0]
+
+
+def adaptive_admin(headers):
+    # Private samples accept only this station's configured code.
+    expected = str(load_config().get('admin_passcode') or '')
+    supplied = headers.get('X-Admin-Key', '')
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 def load_fleet_db():
     if os.path.exists(FLEET_DB_FILE):
@@ -302,6 +313,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 dba_val = int(dba_str)
                 tailpipe_dba = round(dba_val + loss, 1)
                 events.append({
+                    "event_metadata": read_metadata(os.path.join(RECORDINGS_DIR, filename)),
                     "filename": filename,
                     "date": local_date,
                     "time": local_time_fmt,
@@ -320,6 +332,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
+
+        if path == '/adaptive':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(ADAPTIVE_HTML.encode('utf-8'))
+            return
+        if path == '/api/adaptive' or path.startswith('/api/adaptive/'):
+            if not adaptive_admin(self.headers):
+                self.send_json({'error': 'Unauthorized'}, 403)
+                return
+            if path == '/api/adaptive':
+                self.send_json(load_adaptive_report(BASE_DIR, load_config()))
+                return
+            name = urllib.parse.unquote(path.removeprefix('/api/adaptive/clip/'))
+            if not re.fullmatch(r'[A-Za-z0-9_-]+\.wav', name):
+                self.send_error(404)
+                return
+            clip = Path(BASE_DIR)/'adaptive-data'/'clips'/name
+            if not clip.is_file() or clip.is_symlink():
+                self.send_error(404)
+                return
+            serve_range_data(self, clip.read_bytes(), 'audio/wav')
+            return
 
         if path in ["/favicon.ico", "/favicon.svg"]:
             svg_bytes = FAVICON_SVG.encode("utf-8")
@@ -426,7 +462,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not networks:
                 try:
                     res2 = subprocess.run(["iwlist", "wlan0", "scan"], capture_output=True, text=True, timeout=5)
-                    import re
                     ssids = re.findall(r'ESSID:"([^"]+)"', res2.stdout)
                     for s in set(ssids):
                         if s:
@@ -503,6 +538,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
+        if path == '/api/adaptive':
+            if not adaptive_admin(self.headers):
+                self.send_json({'error': 'Unauthorized'}, 403)
+                return
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                if not 0 < length <= 4096:raise ValueError('Invalid request size')
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict) or set(data)-{'mode', 'reset'}:raise ValueError('Invalid pilot control')
+                patch = {}
+                if 'mode' in data:patch['mode'] = data['mode']
+                if data.get('reset') is True:
+                    import uuid
+                    patch['reset_token'] = uuid.uuid4().hex
+                save_config({'adaptive_detection': patch})
+                self.send_json({'success': True})
+            except (ValueError, TypeError) as error:
+                self.send_json({'error': str(error)}, 400)
+            return
 
         if path in ["/api/heartbeat", "/api/fleet/heartbeat"]:
             length = int(self.headers.get("Content-Length", 0))
@@ -602,6 +656,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     if target_to_rename != new_path:
                         os.rename(target_to_rename, new_path)
+                    retag_metadata(target_to_rename, new_path, new_tag)
                     invalidate_events_cache()
                     self.send_json({"success": True, "new_filename": new_filename, "tag": new_tag})
                 except Exception as e:
@@ -656,6 +711,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if target_to_delete:
                 try:
                     os.remove(target_to_delete)
+                    delete_metadata(target_to_delete)
                     invalidate_events_cache()
                     self.send_json({"success": True})
                 except Exception as e:
@@ -775,6 +831,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </button>
       </div>
     </header>
+    <a href="/adaptive" id="adaptivePilotLink" style="display:none" class="text-sm text-indigo-600 mb-4">Adaptive detection pilot &rarr;</a>
+    <script>if (!location.pathname.startsWith('/yegnoise')) document.getElementById('adaptivePilotLink').style.display='inline-block';</script>
 
     <!-- TAB 1: LIVE VIEW -->
     <div id="viewLive" class="space-y-6">
@@ -933,7 +991,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <tr>
               <th onclick="toggleSort('datetime')" class="py-2.5 px-4 cursor-pointer hover:bg-slate-200/80 hover:text-indigo-600 transition whitespace-nowrap" title="Click to sort by Date/Time">
                 <div class="flex items-center gap-1.5">
-                  <span>Timestamp</span>
+                  <span>Recorded (Edmonton time)</span>
                   <i id="sortIcon-datetime" class="fa-solid fa-arrow-down text-indigo-600 text-xs"></i>
                 </div>
               </th>
@@ -1489,12 +1547,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function updateStationBranding(stationName, streetName, locName, floorNum, setbackM) {
       const curPath = window.location.pathname.toLowerCase();
       const combined = ((stationName || '') + ' ' + (locName || '') + ' ' + (streetName || '') + ' ' + curPath).toLowerCase();
+      const skContainer = document.getElementById('stationSketchContainer');
+      const bEl = document.getElementById('headerLocationBadge');
+      // The hub supplies researched artwork before this page loads its data.
+      // Keep that artwork and community label through public-info/config refreshes.
+      const hasCommunityArtwork = !!(skContainer && skContainer.querySelector('svg[data-community-artwork]'));
       
       let stTitle = stationName || locName || 'Traffic Noise Monitor';
       let locTag = '';
       let sketchType = 'default';
       
-      if (combined.includes('whyte') || combined.includes('82') || combined.includes('janz') || combined.includes('strathcona')) {
+      if (hasCommunityArtwork) {
+        locTag = bEl ? bEl.textContent : '';
+      } else if (combined.includes('whyte') || combined.includes('82') || combined.includes('janz') || combined.includes('strathcona')) {
         stTitle = (stationName && stationName.toLowerCase().includes('whyte')) ? stationName : 'Whyte Ave Station';
         locTag = 'Old Strathcona';
         sketchType = 'whyte';
@@ -1517,7 +1582,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       
       document.title = `${stTitle} — Edmonton Noise Bot`;
       
-      const bEl = document.getElementById('headerLocationBadge');
       if (bEl) {
         if (locTag) {
           bEl.innerText = locTag;
@@ -1536,8 +1600,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         sEl.innerText = strName + (details ? ` • ${details}` : ' • Live Acoustic Telemetry');
       }
       
-      const skContainer = document.getElementById('stationSketchContainer');
-      if (skContainer) {
+      if (skContainer && !hasCommunityArtwork) {
         skContainer.innerHTML = getStationSketchSvg(sketchType);
       }
     }

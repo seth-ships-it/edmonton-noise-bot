@@ -31,6 +31,9 @@ except ImportError:
 from config_store import apply_config_patch, read_config
 from notifier import Notifier
 from audio_classifier import classify_audio
+from station_network import wifi_network_id
+from adaptive_runtime import Observer
+from event_metadata import read_metadata
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "noise_bot.log")
@@ -146,6 +149,17 @@ def get_hardware_station_id(cfg=None):
         pass
     return "noise-bot-station"
 
+def recording_timestamp(wav_path):
+    """Return the original UTC recording time, including on upload retries."""
+    match = re.match(r"noise_event_(\d{8})_(\d{6})_", os.path.basename(wav_path))
+    if match:
+        try:
+            return datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return os.path.getmtime(wav_path)
+
+
 def upload_recording_to_hub(wav_path, event_meta):
     if not wav_path or not os.path.exists(wav_path):
         return
@@ -173,8 +187,12 @@ def upload_recording_to_hub(wav_path, event_meta):
             "tailpipe_dba": float(event_meta.get("tailpipe_dba", 95.0)),
             "tag": event_meta.get("tag", "traffic"),
             "audio_b64": audio_b64,
-            "timestamp": time.time()
+            "timestamp": recording_timestamp(wav_path)
         }
+        metadata = read_metadata(wav_path, wait_seconds=5 if cfg.get('adaptive_detection', {}).get('mode') == 'shadow' else 0)
+        if metadata:
+            payload['event_metadata'] = metadata
+            payload['timestamp'] = metadata['start_utc']
         
         endpoint = f"{hub_url}/api/recordings/upload"
         req_data = json.dumps(payload).encode("utf-8")
@@ -262,9 +280,11 @@ def send_fleet_heartbeat(event_payload=None):
             return
 
         live_dba = 0.0
+        live = {}
         if os.path.exists(LIVE_STATE_FILE):
             with open(LIVE_STATE_FILE, "r", encoding="utf-8") as f:
-                live_dba = json.load(f).get("current_dba", 0.0)
+                live = json.load(f)
+                live_dba = live.get("current_dba", 0.0)
 
         total_events = 0
         if os.path.exists(OUTPUT_DIR):
@@ -282,7 +302,9 @@ def send_fleet_heartbeat(event_payload=None):
             "distance_to_road_meters": cfg.get("distance_to_road_meters", 10.0),
             "current_dba": live_dba,
             "total_violations": total_events,
-            "version": "v1.4"
+            "version": "v1.4",
+            "approval_reporting_version": 1,
+            "wifi_network_id": wifi_network_id(station_id)
         }
 
         payload.update({
@@ -293,6 +315,8 @@ def send_fleet_heartbeat(event_payload=None):
                 "calibration_offset", "threshold_dba", "audio_device_index",
                 "cooldown_period_minutes", "record_event_seconds", "save_audio_files") if key in cfg},
         })
+        if live.get('adaptive_detection'):
+            payload['adaptive_detection'] = live['adaptive_detection']
 
         if event_payload:
             payload["event"] = event_payload
@@ -337,6 +361,10 @@ def start_fleet_sync_thread():
     t.start()
 
 def main():
+    import signal as os_signal
+    def shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+    os_signal.signal(os_signal.SIGTERM, shutdown)
     parser = argparse.ArgumentParser(description="Noise Monitor Bot Engine")
     parser.add_argument("--list-devices", action="store_true", help="List audio input devices and exit")
     parser.add_argument("--device", type=int, default=None, help="Audio input device index")
@@ -350,14 +378,18 @@ def main():
         print(json.dumps(devs, indent=2))
         return
 
-    start_fleet_sync_thread()
-
     config = {}
     if os.path.exists(CONFIG_FILE):
         try:
             config = read_config(CONFIG_FILE)
         except Exception as e:
             logging.error(f"Failed to read {CONFIG_FILE}: {e}")
+
+    calibration_pending = config.get("calibration_status") == "unverified_after_microphone_change"
+    if calibration_pending:
+        logging.warning("Microphone calibration pending: local measurement preview only; fleet reports and violation notifications paused")
+    else:
+        start_fleet_sync_thread()
 
     threshold_dba = args.threshold or config.get("threshold_dba") or 70.0
     calibration_offset = args.offset or config.get("calibration_offset") or 95.0
@@ -379,8 +411,25 @@ def main():
     channels = 1
     p_dev_count = p.get_device_count()
 
-    # Priority 1: Specifically search PyAudio input devices for Yeti
-    for i in range(p_dev_count):
+    # An explicitly named microphone must not silently fall back to another input.
+    preferred_name = str(config.get("audio_device_name") or "").strip()
+    if preferred_name and args.device is None:
+        matches = []
+        for i in range(p_dev_count):
+            info = p.get_device_info_by_index(i)
+            name = (info.get("name") or "").split(":", 1)[0].strip()
+            if info.get("maxInputChannels", 0) > 0 and name.casefold() == preferred_name.casefold():
+                matches.append((i, info))
+        if len(matches) != 1:
+            logging.error("Configured microphone %r has %d matching inputs; waiting for that device", preferred_name, len(matches))
+            p.terminate()
+            return
+        target_device, info = matches[0]
+        channels = min(2, max(1, int(info["maxInputChannels"])))
+        logging.info("Selected configured microphone: [%s] %s (%s channels)", target_device, info["name"], channels)
+
+    # Legacy Yeti preference applies only when no microphone was explicitly named.
+    for i in range(p_dev_count) if target_device is None else []:
         try:
             info = p.get_device_info_by_index(i)
             dev_name = (info.get("name") or "").lower()
@@ -440,9 +489,14 @@ def main():
         )
         logging.info(f"Opened audio input stream on Device {target_device} ({channels} channels, {RATE} Hz)")
     except Exception as e:
+        if preferred_name and args.device is None:
+            logging.error("Failed to open configured microphone %r: %s", preferred_name, e)
+            p.terminate()
+            return
         logging.warning(f"Failed to open audio device {target_device} with {channels} ch: {e}. Retrying default...")
         try:
             channels = 1
+            target_device = None
             stream = p.open(
                 format=FORMAT,
                 channels=channels,
@@ -456,6 +510,15 @@ def main():
             return
 
     logging.info(f"Noise detector running. Threshold: {threshold_dba} dBA, Calibration: {calibration_offset} dB")
+    actual_input = p.get_device_info_by_index(target_device) if target_device is not None else p.get_default_input_device_info()
+    card_match = re.search(r'hw:(\d+),', actual_input.get('name', ''))
+    observer_config = config if HAS_SCIPY and not calibration_pending and not args.test_mic else {**config, 'adaptive_detection': {'mode': 'off'}}
+    observer = Observer(BASE_DIR, observer_config, {
+        'station_id': get_hardware_station_id(config), 'microphone': actual_input.get('name'),
+        'alsa_card': int(card_match.group(1)) if card_match else None,
+        'sample_rate': RATE, 'channels': channels, 'mix': 'arithmetic_mean'})
+    event_reference = {}
+    event_config = {}
 
     pre_trigger_seconds = 2.0
     post_trigger_seconds = record_seconds - pre_trigger_seconds
@@ -483,6 +546,7 @@ def main():
 
             # Convert to float array and downmix stereo to mono if needed
             signal_data = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+            clipped_input = bool(np.max(np.abs(signal_data), initial=0) >= 32760)
             if channels > 1:
                 signal_data = signal_data.reshape(-1, channels).mean(axis=1)
 
@@ -512,6 +576,8 @@ def main():
                         threshold_dba = args.threshold or config.get("threshold_dba") or 70.0
                         calibration_offset = args.offset if args.offset is not None else config.get("calibration_offset", 95.0)
                         config_mtime = current_mtime
+                        if not calibration_pending and not args.test_mic and HAS_SCIPY:
+                            observer.configure(config)
                 except (OSError, ValueError) as exc:
                     logging.warning("Settings reload deferred: %s", exc)
             if now - last_state_write_time > 0.2:
@@ -521,7 +587,12 @@ def main():
                         "timestamp": now,
                         "current_dba": round(dba, 1),
                         "is_recording": is_recording_event,
-                        "threshold_dba": threshold_dba
+                        "threshold_dba": threshold_dba,
+                        "audio_device_name": preferred_name,
+                        "calibration_status": config.get("calibration_status", "legacy"),
+                        "current_dbfs_a": round(float(20 * np.log10(max(rms, 1e-12))), 2),
+                        "preview_only": calibration_pending,
+                        "adaptive_detection": observer.snapshot()
                     }
                     with open(LIVE_STATE_FILE, "w", encoding="utf-8") as f:
                         json.dump(state_payload, f)
@@ -536,14 +607,23 @@ def main():
                 sys.stdout.flush()
                 continue
 
+            if calibration_pending:
+                continue
+
             current_time = time.time()
             in_cooldown = (current_time - last_notification_time) < cooldown_period
+            # Observe the SAME stream. No adaptive value controls legacy capture.
+            observer.submit(normalized, weighted, now, time.monotonic(),
+                            is_recording_event or (dba >= threshold_dba and not in_cooldown),
+                            dba >= threshold_dba, clipped_input)
 
             if not is_recording_event:
                 if dba >= threshold_dba and not in_cooldown:
                     logging.info(f"Threshold exceeded! {dba:.1f} dBA >= {threshold_dba} dBA. Recording event...")
                     is_recording_event = True
                     event_start_time = current_time
+                    event_reference = observer.snapshot()
+                    event_config = dict(config)
                     event_peak_dba = dba
                     event_frames = list(audio_history)
                     post_trigger_count = 0
@@ -557,6 +637,8 @@ def main():
                     is_recording_event = False
                     last_notification_time = current_time
                     wav_path = None
+                    final_filename = None
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                     tag = "traffic"
 
                     if save_audio:
@@ -578,6 +660,10 @@ def main():
                             wav_path = os.path.join(output_dir, final_filename)
                             os.rename(temp_path, wav_path)
                             logging.info(f"Saved event recording ({tag}): {wav_path}")
+                            observer.annotate(wav_path, trigger_utc=event_start_time, end_utc=now,
+                                              duration=sum(len(x) for x in event_frames)/(RATE*channels*2),
+                                              peak_dba=float(event_peak_dba), tag=tag, reference=event_reference,
+                                              config=event_config)
                         except Exception as e:
                             logging.error(f"Failed to save WAV file: {e}")
                             wav_path = None
@@ -618,6 +704,7 @@ def main():
             stream.stop_stream()
             stream.close()
         p.terminate()
+        observer.close()
 
 if __name__ == "__main__":
     main()

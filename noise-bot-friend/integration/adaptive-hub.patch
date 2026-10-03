@@ -1,0 +1,41 @@
+--- a/fleet_hub_server.py
++++ b/fleet_hub_server.py
+@@ -7,0 +8 @@
++from event_metadata import atomic_json, sidecar_path, read_metadata, retag_metadata, delete_metadata, validated_event_metadata, upsert_hub_event
+@@ -827,0 +829 @@
++    html = re.sub(r'<a href="/adaptive"[^>]*>.*?</a>', '', html)
+@@ -1220,0 +1223 @@
++                            retag_metadata(src, dst, tag_name)
+@@ -1255,0 +1259 @@
++                            delete_metadata(os.path.join(root, f))
+@@ -1746,0 +1751 @@
++                                    "event_metadata": read_metadata(os.path.join(d, fn)),
+@@ -2899,0 +2905,4 @@
++                    adaptive = payload.get('adaptive_detection')
++                    if isinstance(adaptive, dict) and len(json.dumps(adaptive, allow_nan=False)) <= 16384:
++                        station_info['adaptive_detection'] = adaptive
++
+@@ -2936 +2945 @@
+-                        db["recent_violations"].append({
++                        upsert_hub_event(db["recent_violations"], {
+@@ -3014 +3023,6 @@
+-                t_val = recording_event_timestamp(filename, data.get("timestamp", now))
++                event_metadata = validated_event_metadata(data.get('event_metadata'))
++                if event_metadata:
++                    for directory in (os.path.join(RECORDINGS_DIR, station_id), RECORDINGS_DIR):
++                        wav_path = os.path.join(directory, os.path.basename(filename))
++                        if os.path.isfile(wav_path):atomic_json(sidecar_path(wav_path), event_metadata)
++                t_val = event_metadata['start_utc'] if event_metadata else recording_event_timestamp(filename, data.get("timestamp", now))
+@@ -3033,0 +3048 @@
++                if event_metadata:ev_entry['event_metadata'] = event_metadata
+@@ -3035,9 +3050 @@
+-                exists = False
+-                for existing in db["recent_violations"]:
+-                    if existing.get("filename") == filename:
+-                        existing.update(ev_entry)
+-                        exists = True
+-                        break
+-                if not exists:
+-                    db["recent_violations"].append(ev_entry)
+-                    db["recent_violations"] = db["recent_violations"][-100:]
++                upsert_hub_event(db['recent_violations'], ev_entry)

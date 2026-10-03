@@ -6,7 +6,7 @@ import os
 def classify_audio(wav_path):
     """
     Analyzes audio WAV file and classifies it as:
-    - 'vehicle': Confirmed vehicle exhaust / engine rumble
+    - 'vehicle': Possible vehicle exhaust / engine rumble (heuristic)
     - 'ets': Transit bus (heavy diesel engine roar, pneumatic air brakes, sustained pass-by)
     - 'weather': Rain / wind broadband noise
     - 'bbq': BBQ / patio noise (lid drop, scraping, sizzling, tongs)
@@ -18,6 +18,15 @@ def classify_audio(wav_path):
         
     try:
         sample_rate, data = wavfile.read(wav_path)
+        return classify_samples(data, sample_rate)
+    except Exception as e:
+        print(f"Classification error for {wav_path}: {e}")
+        return "review"
+
+
+def classify_samples(data, sample_rate):
+    """Apply the same heuristic to memory samples without writing a WAV."""
+    try:
         if len(data) == 0:
             return "review"
             
@@ -87,5 +96,5 @@ def classify_audio(wav_path):
         return "review"
 
     except Exception as e:
-        print(f"Classification error for {wav_path}: {e}")
+        print(f"Classification error: {e}")
         return "review"
