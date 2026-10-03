@@ -1,7 +1,7 @@
 # Explicit local pilot image; automatic image updates are disabled for this app.
 services:
   noise-bot:
-    image: noise-bot:2026.10.03-shadow.1
+    image: noise-bot:2026.10.03-shadow.2
     pull_policy: never
     labels:
       com.centurylinklabs.watchtower.enable: "false"

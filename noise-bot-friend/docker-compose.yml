@@ -23,6 +23,7 @@ services:
       - ./config_store.py:/app/config_store.py
       - ./adaptive_detector.py:/app/adaptive_detector.py
       - ./adaptive_runtime.py:/app/adaptive_runtime.py
+      - ./adaptive_guard.py:/app/adaptive_guard.py
       - ./adaptive_report.py:/app/adaptive_report.py
       - ./event_metadata.py:/app/event_metadata.py
       - ./audio_classifier.py:/app/audio_classifier.py

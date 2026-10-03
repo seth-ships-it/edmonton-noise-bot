@@ -1,9 +1,10 @@
 {
-  "release": "2026.10.03-shadow.1",
+  "release": "2026.10.03-shadow.2",
   "files": {
-    "adaptive_detector.py": "6922f80405720cf010cfbf5623ef33cee379ca4213bd743ec9441e532d140671",
-    "adaptive_runtime.py": "94f1149934bb25cec70e1579a55fb2c612a6721c6eff809c74724aa9ea886c83",
-    "adaptive_report.py": "b3033a28448ec155b123bbe25aa0059456fce56cc922b59c5d95edc4474411bf",
+    "adaptive_detector.py": "d9f5641fe81b39cea88141c44f4ea389ae7d940bf00b89ba3c278ba53f6e122d",
+    "adaptive_runtime.py": "1119e082f049f0d22629469143902934663d18e76ecb7b36a179ab1105e3dea9",
+    "adaptive_guard.py": "3262df2130c17460b6fe1f21234ef8b41cea59d1f9137c23f2d9c6ddf09e7917",
+    "adaptive_report.py": "3c725306b9027d5715833a69d73cfe54347f8388b7abc087db55fa28914e246a",
     "audio_classifier.py": "5ed14bf09e000bf64450a68900945da263cbe4edd986995dd899e8ac896f4b75",
     "event_metadata.py": "2fd0461fc824f14a8b359201eecfb556644e4388cad9d64e52af140965cc72ad",
     "config_store.py": "9587ef15e37cdf7d1e6a4b9e758b3862fe510d9e661e4087d41848f38a8ad819",

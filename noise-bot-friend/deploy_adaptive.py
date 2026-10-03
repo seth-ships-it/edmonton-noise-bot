@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import time
 
-FILES = ('adaptive_detector.py','adaptive_runtime.py','adaptive_report.py','audio_classifier.py',
+FILES = ('adaptive_detector.py','adaptive_runtime.py','adaptive_guard.py','adaptive_report.py','audio_classifier.py',
          'event_metadata.py','config_store.py','station_network.py','noise_detector.py','dashboard.py')
 SERVICES = ('noise-detector.service','noise-dashboard.service')
 
@@ -66,6 +66,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',required=True)
     parser.add_argument('--station-id',required=True)
+    parser.add_argument('--allow-unstable-power',action='store_true',
+                        help='Explicitly allow this guarded shadow trial despite current power faults')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('--apply',action='store_true')
     group.add_argument('--rollback',type=Path)
@@ -81,8 +83,8 @@ def main():
         restore(root,args.rollback.resolve())
         print(json.dumps({'rolled_back':True,'station_id':args.station_id}));return
     power = int(command('vcgencmd','get_throttled').split('=')[1], 16)
-    if power & 0x5:
-        raise ValueError('Current undervoltage or throttling: keep fixed recording and resolve power before the pilot')
+    if power & 0x5 and not args.allow_unstable_power:
+        raise ValueError('Current undervoltage or throttling; guarded trial requires explicit --allow-unstable-power')
     if root==stage:raise ValueError('Run from a separate staging directory')
     manifest=json.loads((stage/'adaptive-manifest.json').read_text())
     for name in FILES:
@@ -93,13 +95,15 @@ def main():
         if name in manifest.get('expected_live',{}) and digest(root/name)!=manifest['expected_live'][name]:
             raise ValueError('Live file changed since inventory: '+name)
     print(json.dumps({'dry_run':not args.apply,'station_id':args.station_id,'file_count':len(FILES),
-                      'mode':'shadow','calibration_offset':config.get('calibration_offset') }))
+                      'mode':'shadow','calibration_offset':config.get('calibration_offset'),
+                      'power_flags':hex(power),'allow_unstable_power':args.allow_unstable_power }))
     if not args.apply:return
     from config_store import apply_config_patch
     from event_metadata import atomic_json
     backup=root.parent/('adaptive-backup-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     backup.mkdir(mode=0o700)
-    record={'root':str(root),'prior_adaptive':config.get('adaptive_detection'),'files':{}}
+    record={'root':str(root),'prior_adaptive':config.get('adaptive_detection'),'files':{},
+            'power_flags':hex(power),'allow_unstable_power':args.allow_unstable_power}
     shutil.copy2(root/'config.json',backup/'config.private.json')
     for name in FILES:
         existed=(root/name).exists()

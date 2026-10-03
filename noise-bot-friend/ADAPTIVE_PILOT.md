@@ -52,7 +52,7 @@ Storage under `adaptive-data/` is bounded:
 - Hourly coverage: 90 days. Reports show the latest 168 hours.
 - Private WAV samples: 128 MiB / seven days, up to 20 disagreement and five other
   comparison samples per local period/date. Summaries continue after sample caps.
-- A 256 MiB free-space reserve suspends optional writes. Queue pressure drops
+- A 256 MiB free-space reserve stops optional learning and writes. Queue pressure drops
   optional analysis; the existing recorder retains its own audio stream.
 - Checkpoints save every minute and on orderly shutdown; a hard power loss can
   discard up to a minute of learning. Reports/transactions update about every ten
@@ -60,9 +60,8 @@ Storage under `adaptive-data/` is bounded:
 
 `audio_gaps` records timing discontinuities inferred from capture arrival times,
 including delayed processing; it is not a hardware measurement of lost samples.
-Those periods are excluded from learning. An SD-card/worker error reports degraded
-status and leaves fixed recording active. Resolve the error and toggle off/shadow
-to restart the worker. Analysis never opens a second microphone stream.
+Those periods are excluded from learning. An SD-card/worker error stops shadow learning, saves off mode and leaves fixed
+recording active. Resolve the error and select shadow again to restart the worker. Analysis never opens a second microphone stream.
 
 New public WAVs receive `.event.json` sidecars containing event identity, UTC
 times, raw peak/Leq, frozen references, relative excess, calibration revision,
@@ -70,6 +69,39 @@ quality and classification context. Upload retries reuse these values. Retagging
 keeps event identity and records a reviewed label; deletion removes the sidecar.
 Older WAVs show unavailable relative values. Incomplete analysis is explicitly
 flagged, and private review clips are never uploaded or notified.
+
+## Automatic pilot stop conditions
+
+A lightweight guardian samples health every 10 seconds. It disables only shadow
+learning, persists `adaptive_detection.mode=off`, and saves the reason in
+`adaptive-data/guard.json` and the private report. The fixed recorder continues.
+There is no automatic retry after a stop; resolve the cause and manually select
+shadow again. If storage failure prevents saving the setting, the in-process
+latch still stops analysis and the report identifies the persistence failure.
+
+| Parameter | Stop condition |
+| --- | --- |
+| Free disk | Below 256 MiB |
+| Capture feed | No new block for 15 seconds |
+| Current Pi undervoltage/throttling | Continuously present at checks for 120 seconds |
+| Technical analysis coverage | Below 90% over a full 5-minute window |
+| Optional analysis queue loss | Above 1% of submitted blocks over 5 minutes |
+| Whole detector process CPU | Above 60% of one core over 5 minutes |
+| Whole detector process RSS | More than 64 MiB over startup for 120 seconds |
+| Worker/guardian exception | Stop immediately when caught |
+
+These are pilot limits, not acoustic standards. Historical power flags do not
+count as current faults. Technical coverage counts missing, delayed, clipped,
+zero or nonfinite analysis; suspected weather only excludes learning samples.
+CPU and memory include the existing detector and cannot attribute overhead to the
+learner alone. Rate limits need one full five-minute window. Stop latency can be
+up to one health interval beyond a duration limit (plus command scheduling).
+The guardian shares the process and cannot recover a total process/OS failure.
+Normal loud events, sparse traffic and incomplete learning are not stop signals.
+
+A guarded trial with a known intermittent power fault must explicitly pass
+`--allow-unstable-power` to the deployment helper. That choice is recorded in the
+backup, and does not bypass disk, identity, checksum or automatic stop checks.
 
 ## Native pilot deployment
 
@@ -136,5 +168,6 @@ capture gaps. Sparse periods stay in learning. Readiness never activates capture
 
 During the first live check on October 3, the Pi reported current undervoltage /
 throttling and capture timing discontinuities. Rollback to the original detector
-passed. The pilot remains off pending a power check. The central-hub restart was
-blocked by automatic approval review; its tested patch remains staged.
+passed. The subsequent shadow.2 release adds a guarded, explicitly authorized trial
+while the replacement power supply is pending. Check the local report for actual
+running/stopped state. Central-hub integration remains staged.

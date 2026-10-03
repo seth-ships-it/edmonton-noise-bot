@@ -12,7 +12,7 @@ import statistics
 import uuid
 from zoneinfo import ZoneInfo
 
-RELEASE = '2026.10.03-shadow.1'
+RELEASE = '2026.10.03-shadow.2'
 SCHEMA = 1
 WINDOW_SECONDS = .125
 PERIODS = ('day', 'evening', 'night')

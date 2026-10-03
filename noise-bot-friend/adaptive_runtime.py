@@ -21,6 +21,8 @@ import wave
 import numpy as np
 
 from adaptive_detector import Learner, RELEASE, WINDOW_SECONDS, fingerprint, period_at, settings
+from adaptive_guard import GuardPolicy, HARD_AUDIO_FLAGS, LIMITS
+from config_store import apply_config_patch
 from event_metadata import atomic_json, calibration_revision, sidecar_path
 
 RESERVE_BYTES = 256 * 1024 * 1024
@@ -76,6 +78,14 @@ class ShadowRuntime:
         self.dropped_blocks = 0
         self.gap_count = 0
         self.worker_errors = 0
+        self.submitted_blocks = 0
+        self.technical_seconds = 0.
+        self.last_capture_monotonic = time.monotonic()
+        self.guard_policy = GuardPolicy()
+        self.guard_trip = None
+        self.guard_metrics = {}
+        self.guard_lock = threading.Lock()
+        self.guard_thread = None
         self.stop_event = threading.Event()
         self.thread = None
         self.db = None
@@ -96,12 +106,83 @@ class ShadowRuntime:
         self.gain = None
         self.last_options_fingerprint = None
         if self.enabled and start:
+            # Start the guardian before the worker so its baseline includes
+            # worker startup. It never reads SQLite or owns an audio stream.
+            self.guard_thread = threading.Thread(target=self._guard_loop, name='adaptive-guard', daemon=True)
+            self.guard_thread.start()
             self.thread = threading.Thread(target=self._run, name='adaptive-shadow', daemon=True)
             self.thread.start()
 
     def snapshot(self):
         with self.lock:
-            return copy.deepcopy(self.status)
+            result = copy.deepcopy(self.status)
+        result['guard'] = {'limits': LIMITS, 'metrics': dict(self.guard_metrics),
+                           'trip': copy.deepcopy(self.guard_trip)}
+        if self.guard_trip:
+            result.update(mode='off', status='guard_stopped', fallback_reason=self.guard_trip['reason'])
+        return result
+
+    def _guard_sample(self):
+        power = None
+        try:
+            r = subprocess.run(['vcgencmd', 'get_throttled'], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                power = int(r.stdout.strip().split('=')[1], 16)
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
+        # Linux native pilot. Unsupported hosts may still use offline replay;
+        # unknown RSS/power are reported rather than invented measurements.
+        try:
+            rss = next(float(line.split()[1])/1024 for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmRSS:'))
+        except (OSError, StopIteration, ValueError):
+            rss = 0.
+        return {'monotonic': time.monotonic(), 'process_cpu_seconds': time.process_time(),
+                'rss_mib': rss, 'power_flags': power,
+                'free_mib': shutil.disk_usage(self.root.parent).free/1024**2,
+                'last_capture_monotonic': self.last_capture_monotonic,
+                'submitted_blocks': self.submitted_blocks, 'dropped_blocks': self.dropped_blocks,
+                'technical_seconds': self.technical_seconds, 'worker_errors': self.worker_errors}
+
+    def _guard_loop(self):
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            # A new explicitly enabled run replaces the old latched trip.
+            with self.guard_lock:
+                if self.guard_trip is not None:
+                    return
+                atomic_json(self.root/'guard.json', {'state': 'armed', 'started_utc': time.time(), 'limits': LIMITS})
+            while not self.stop_event.is_set():
+                reason = self.guard_policy.evaluate(self._guard_sample())
+                self.guard_metrics = dict(self.guard_policy.metrics)
+                if reason:
+                    self._trip_guard(reason)
+                    return
+                self.stop_event.wait(LIMITS['sample_seconds'])
+        except Exception:
+            logging.exception('Optional adaptive guardian failed')
+            self._trip_guard('guard_monitor_error')
+
+    def _trip_guard(self, reason):
+        with self.guard_lock:
+            if self.guard_trip is not None:
+                return
+            self.guard_trip = {'reason': reason, 'utc': time.time(), 'metrics': dict(self.guard_metrics),
+                               'persisted_mode_off': False}
+            self.stop_event.set()
+        # Only the optional mode changes. Config merge preserves microphone
+        # calibration, threshold, credentials and concurrent placement edits.
+        try:
+            apply_config_patch(self.root.parent/'config.json', {'adaptive_detection': {'mode': 'off'}})
+            self.guard_trip['persisted_mode_off'] = True
+        except Exception as error:
+            self.guard_trip['persistence_error'] = type(error).__name__
+            logging.exception('Shadow stopped in memory; could not persist off mode')
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            atomic_json(self.root/'guard.json', {'state': 'tripped', 'trip': self.guard_trip, 'limits': LIMITS})
+        except OSError:
+            logging.exception('Could not save optional guardian stop report')
+        logging.warning('Optional adaptive learning stopped: %s; fixed recording continues', reason)
 
     def configure(self, config):
         options = settings(config.get('adaptive_detection'))
@@ -112,6 +193,8 @@ class ShadowRuntime:
     def submit(self, raw, weighted, utc, monotonic, fixed_captured, fixed_above, clipped=False):
         if not self.enabled or self.stop_event.is_set():
             return
+        self.last_capture_monotonic = time.monotonic()
+        self.submitted_blocks += 1
         try:
             self.blocks.put_nowait((np.asarray(raw, dtype=np.float32).copy(),
                                    np.asarray(weighted, dtype=np.float32).copy(), float(utc),
@@ -229,6 +312,8 @@ class ShadowRuntime:
                 flags.append('nonfinite_audio')
                 energy = 1e-24
             level = 10*math.log10(max(energy, 1e-24))
+            if not HARD_AUDIO_FLAGS.intersection(flags):
+                self.technical_seconds += WINDOW_SECONDS
             pcm = np.clip(segment*32768, -32768, 32767).astype('<i2').tobytes()
             actions = self.learner.step(level, window_utc, flags=flags, fixed_captured=captured, fixed_above=above)
             self.last_window_utc = window_utc
@@ -344,6 +429,7 @@ class ShadowRuntime:
         if not self._space():
             self.db.rollback()
             with self.lock:self.status = {**self.status, 'status': 'degraded', 'fallback_reason': 'disk_reserve', 'updated_utc': utc}
+            self._trip_guard('disk_reserve')
             return
         self.db.execute('DELETE FROM seconds WHERE utc < ?', (utc-7*86400,))
         self.db.execute('DELETE FROM events WHERE utc < ?', (utc-7*86400,))
@@ -374,6 +460,7 @@ class ShadowRuntime:
                   'audio_gaps': self.gap_count, 'worker_errors': self.worker_errors,
                   'gain_observed': self.gain != 'unknown', 'recovery_note': self.learner.recovery_note,
                   'activation': 'manual_review_required', 'private_audio_bytes': size,
+                  'guard': {'limits': LIMITS, 'metrics': dict(self.guard_metrics), 'trip': copy.deepcopy(self.guard_trip)},
                   'coverage_hours': [{'utc_hour':row[0], 'valid_seconds':row[1], 'excluded_seconds':row[2]} for row in self.db.execute('SELECT * FROM hours ORDER BY hour DESC LIMIT 168')]}
         # Summaries are public-safe; raw candidate arrays remain only in state.json.
         report['periods'] = {p: {'screened_candidates':len(s['peaks']), 'observed_candidates':len(s['observed']),
@@ -402,9 +489,11 @@ class ShadowRuntime:
             self.worker_errors += 1
             logging.exception('Optional adaptive analysis stopped; fixed recorder continues')
             with self.lock:self.status.update(status='degraded', fallback_reason=type(error).__name__, worker_errors=self.worker_errors)
+            self._trip_guard('worker_error')
         finally:
             if self.db:self.db.close()
             self.enabled = False
+            self.stop_event.set()
 
 
 class Observer:
@@ -414,9 +503,11 @@ class Observer:
         self.runtime = None
         self.config = {}
         self.error = None
+        self.resume_requested = False
         self.configure(config)
 
     def configure(self, config):
+        previous_mode = self.config.get('adaptive_detection', {}).get('mode', 'off')
         try:
             options = settings(config.get('adaptive_detection'))
             self.error = None
@@ -424,17 +515,23 @@ class Observer:
             options = settings()
             self.error = str(error)
         self.config = {**copy.deepcopy(config), 'adaptive_detection': options}
+        if previous_mode == 'off' and options['mode'] == 'shadow':
+            self.resume_requested = True
         if self.runtime:
             self.runtime.configure(self.config)
             if options['mode'] == 'off':self.runtime.close(wait=False)
 
     def submit(self, *args):
         if self.config['adaptive_detection']['mode'] != 'shadow':return
+        if self.runtime and self.runtime.guard_trip and not self.resume_requested:return
         if self.runtime is None or (self.runtime.stop_event.is_set() and not self.runtime.thread.is_alive()):
             self.runtime = ShadowRuntime(self.root, self.config, self.identity)
+            self.resume_requested = False
         self.runtime.submit(*args)
 
     def snapshot(self):
+        if self.runtime and self.runtime.guard_trip:
+            return self.runtime.snapshot()
         if self.config['adaptive_detection']['mode'] == 'off':
             return {'mode': 'off', 'status': 'degraded' if self.error else 'off',
                     'fallback_reason': self.error, 'release': RELEASE}
