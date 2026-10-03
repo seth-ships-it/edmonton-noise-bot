@@ -16,3 +16,6 @@ Thumbs.db
 adaptive-data/
 config.json
 *.event.json
+.archive-retention/
+*retention.private.json
+retention-state/
